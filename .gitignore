@@ -19,6 +19,9 @@ build/POE2FlaskBot/
 *.swp
 *.swo
 
+# Augment skill (local AI agent docs, not for public repo)
+.augment/
+
 # Config (contains personal settings)
 config.json
 
