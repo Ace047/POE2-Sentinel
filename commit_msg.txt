@@ -1,8 +1,0 @@
-Fix zone change HP/MP drift and window icon in bundled exe
-
-- Fix structural detection HP/MP values becoming incorrect after zone change
-  - Track player entity pointer and invalidate Life component cache on change
-  - No longer requires stopping/restarting bot after zone transitions
-- Fix window icon not showing in bundled exe (was blue square)
-  - Bundle icon file as data in PyInstaller spec
-  - Use sys._MEIPASS for icon path resolution in frozen exe

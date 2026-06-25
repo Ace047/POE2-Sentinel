@@ -28,6 +28,9 @@ tesseract-portable/
 # Logs
 *.log
 
+# Temp commit message file
+commit_msg.txt
+
 # OS
 .DS_Store
 Thumbs.db
