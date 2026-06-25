@@ -1505,12 +1505,18 @@ class SentinelGUI:
         except Exception as e:
             self.show_toast(f"Overlay error: {str(e)}", "error")
 
-    def on_bot_update(self, value_type: str, current: int, maximum: int):
-        """Callback when bot updates values."""
+    def on_bot_update(self, value_type: str, current: Optional[int], maximum: Optional[int]):
+        """Callback when bot updates values.
+
+        current/maximum are None when detection is lost (game closed, character
+        swap, loading) - in that case we show a placeholder instead of stale
+        numbers.
+        """
+        text = "-- / --" if current is None or maximum is None else f"{current} / {maximum}"
         if value_type == "life":
-            self.root.after(0, lambda: self.life_label.configure(text=f"{current} / {maximum}"))
+            self.root.after(0, lambda: self.life_label.configure(text=text))
         elif value_type == "mana":
-            self.root.after(0, lambda: self.mana_label.configure(text=f"{current} / {maximum}"))
+            self.root.after(0, lambda: self.mana_label.configure(text=text))
 
     def show_toast(self, message: str, notification_type: str = "info"):
         """Show toast notification (replaces any existing toast)."""

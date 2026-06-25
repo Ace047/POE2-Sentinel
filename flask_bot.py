@@ -382,6 +382,31 @@ class StructureReader:
         self._game_state_slot = None
         self._life_component_cache = None
 
+    def _is_process_alive(self) -> bool:
+        """Return True if the attached game process is still running.
+
+        When the game is closed and reopened, our cached handle points at the
+        now-dead process and every read fails. Detecting that lets read_stats
+        drop the stale handle and reconnect to the new process instead of
+        silently failing until the user restarts the bot.
+        """
+        if not self.pm:
+            return False
+        try:
+            handle = self.pm.process_handle
+            if not handle:
+                return False
+            STILL_ACTIVE = 259
+            exit_code = wintypes.DWORD()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code)
+            )
+            if not ok:
+                return False
+            return exit_code.value == STILL_ACTIVE
+        except Exception:
+            return False
+
     def _read_ptr(self, address: int) -> Optional[int]:
         """Read a 64-bit pointer."""
         if not self.pm or address == 0:
@@ -541,8 +566,26 @@ class StructureReader:
         except:
             return ""
 
-    def _resolve_life_component(self, entity_ptr: int) -> Optional[int]:
-        """Resolve the Life component address for an entity."""
+    def _resolve_life_component(self, player_ptr: int) -> Optional[int]:
+        """Resolve the Life component, tolerating a player->entity indirection.
+
+        Patch 0.5.4 inserted one extra level of indirection: the entity that
+        owns the components is now read_ptr(player_ptr) rather than the player
+        pointer itself. We try the pointer directly first (pre-0.5.4 layout)
+        and then one dereference deeper, returning whichever yields a valid
+        Life component. This keeps the bot working across both layouts without
+        hardcoding a patch-specific offset.
+        """
+        for entity_ptr in (player_ptr, self._read_ptr(player_ptr)):
+            if not entity_ptr or entity_ptr < 0x10000:
+                continue
+            life = self._resolve_life_for_entity(entity_ptr)
+            if life:
+                return life
+        return None
+
+    def _resolve_life_for_entity(self, entity_ptr: int) -> Optional[int]:
+        """Resolve the Life component address for a specific entity pointer."""
         details = self._read_ptr(entity_ptr + self.Offsets.ENTITY_DETAILS_PTR)
         if not details:
             return None
@@ -599,6 +642,13 @@ class StructureReader:
 
     def read_stats(self) -> Optional[Dict[str, int]]:
         """Read current HP, ES, and Mana stats using structure-based approach."""
+        # If the game was closed and reopened, our handle now points at a dead
+        # process. Drop it so we reconnect to the new instance instead of
+        # reading a stale handle/GameState slot forever.
+        if self.connected and not self._is_process_alive():
+            logger.info("Game process no longer alive; reconnecting to new instance...")
+            self.disconnect()
+
         if not self.connected:
             if not self.connect():
                 return None
@@ -1205,7 +1255,7 @@ class AtlasFogReveal:
 class FlaskBot:
     """POE2 Auto Flask Bot with Memory and OCR support."""
 
-    def __init__(self, on_update: Optional[Callable[[str, int, int], None]] = None):
+    def __init__(self, on_update: Optional[Callable[[str, Optional[int], Optional[int]], None]] = None):
         self.config = load_config()
         self.running = False
         self.monitor_thread: Optional[threading.Thread] = None
@@ -1218,6 +1268,10 @@ class FlaskBot:
         self.last_mana_use = 0.0
         self.life_low_streak = 0
         self.mana_low_streak = 0
+
+        # Tracks whether live values are currently shown, so we only clear the
+        # UI once when detection is lost (game closed, char swap, loading).
+        self._values_shown = False
 
     def _init_reader(self) -> None:
         """Initialize the appropriate reader based on detection mode."""
@@ -1282,6 +1336,13 @@ class FlaskBot:
             stats = self.reader.read_stats()
 
             if stats is None:
+                # Detection lost (game closed, character swap, loading screen).
+                # Clear the displayed values once so we don't show stale numbers.
+                if self._values_shown and self.on_update:
+                    self.on_update("life", None, None)
+                    self.on_update("mana", None, None)
+                    self.on_update("es", None, None)
+                self._values_shown = False
                 time.sleep(1.0)  # Wait longer if not connected
                 continue
 
@@ -1318,6 +1379,7 @@ class FlaskBot:
                 # Also report ES separately if available
                 if es_max > 0:
                     self.on_update("es", es_current, es_max)
+            self._values_shown = True
 
             # Only press keys if POE2 is the active window!
             if not self._is_poe_active():
@@ -1376,6 +1438,7 @@ class FlaskBot:
         self.running = True
         self.life_low_streak = 0
         self.mana_low_streak = 0
+        self._values_shown = False
 
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()

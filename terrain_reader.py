@@ -142,10 +142,13 @@ class Poe2Offsets:
     # AreaInstance offsets (from AreaInstance base)
     class AreaInstance:
         AREA_INFO_PTR = 0x0A0       # ✓ -> AreaInfo
-        LOCAL_PLAYER = 0x5A0        # ✓ -> player Entity
-        AWAKE_ENTITIES = 0x6C0      # ✓ StdMap of live entities
-        SLEEPING_ENTITIES = 0x6D0   # ✓ StdMap of inactive entities
-        TERRAIN_METADATA = 0x8A0    # ✓ -> TerrainStruct base (THIS IS THE KEY!)
+        LOCAL_PLAYER = 0x5A0        # ✓ -> player Entity (unchanged in 0.5.4)
+        # Patch 0.5.4 inserted 0x18 bytes after LocalPlayer, shifting every
+        # AreaInstance field above 0x5A0 by +0x18 (verified live via
+        # tools/diagnose_overlay.py).
+        AWAKE_ENTITIES = 0x6D8      # ✓ StdMap of live entities (was 0x6C0)
+        SLEEPING_ENTITIES = 0x6E8   # ✓ StdMap of inactive entities (was 0x6D0)
+        TERRAIN_METADATA = 0x8B8    # ✓ -> TerrainStruct base (was 0x8A0)
         CURRENT_AREA_LEVEL = 0x0C4  # ✓ int
         CURRENT_AREA_HASH = 0x11C   # ✓ uint
 
@@ -345,6 +348,11 @@ class TerrainReader:
         self._in_game_state_addr: Optional[int] = None  # Heap object address
         self._area_instance_addr: Optional[int] = None
         self._terrain_addr: Optional[int] = None
+
+        # Maps a raw entity pointer to the pointer whose components actually
+        # resolve. Patch 0.5.4 wraps entities behind one extra indirection, so
+        # the real entity is read_ptr(raw_ptr). Reset on zone change.
+        self._real_entity_cache: dict = {}
 
         # Map UI element tracking (for toggler detection like POE2Radar)
         self._map_elements: List[int] = []  # Discovered MapUiElement addresses
@@ -626,6 +634,9 @@ class TerrainReader:
         self._ever_hidden.clear()
         self._map_cache_key = None
 
+        # Real-entity indirection mapping is per-area (pointers are recycled)
+        self._real_entity_cache.clear()
+
         # Entity caches will be invalidated by entity reader itself (checks area)
 
     def check_zone_change(self) -> bool:
@@ -753,6 +764,9 @@ class TerrainReader:
         player_ptr = self._read_ptr(area + Poe2Offsets.AreaInstance.LOCAL_PLAYER)
         if not player_ptr:
             return None
+
+        # 0.5.4 wraps the player entity behind one extra indirection.
+        player_ptr = self._real_entity(player_ptr) or player_ptr
 
         # Get the Render component from the player's component list
         render_comp = self._find_component(player_ptr, "Render")
@@ -1094,6 +1108,7 @@ class TerrainReader:
             self._meta_cache = {}
             self._rarity_cache = {}
             self._entity_id_map = {}  # Track entity IDs for recycled address detection
+            self._real_entity_cache.clear()  # Indirection mapping is per-area
 
         entities = []
 
@@ -1145,6 +1160,10 @@ class TerrainReader:
             # Skip visuals/decorations (high entity ids)
             if entity_ptr == 0 or entity_id >= Poe2Offsets.EntityList.VISUAL_ID_THRESHOLD:
                 continue
+
+            # 0.5.4 wraps entities behind one extra indirection. Resolve to the
+            # real entity so all downstream component/metadata reads work.
+            entity_ptr = self._real_entity(entity_ptr) or entity_ptr
 
             # Recycled address detection: if this address had a different ID before,
             # clear cached data for this address (the old entity is gone)
@@ -1444,6 +1463,47 @@ class TerrainReader:
             return False
 
         return data[0] != 0
+
+    def _entity_resolves(self, entity_ptr: int) -> bool:
+        """Return True if entity_ptr exposes a valid, non-empty component table.
+
+        Used to distinguish a real entity from the 0.5.4 wrapper pointer (which
+        has no usable EntityDetails/ComponentLookUp/ComponentList).
+        """
+        if not entity_ptr or entity_ptr < 0x10000:
+            return False
+        details = self._read_ptr(entity_ptr + Poe2Offsets.Entity.ENTITY_DETAILS_PTR)
+        if not details or details < 0x10000:
+            return False
+        lookup = self._read_ptr(details + Poe2Offsets.EntityDetails.COMPONENT_LOOKUP_PTR)
+        if not lookup or lookup < 0x10000:
+            return False
+        comp_list = self._read_std_vector(entity_ptr + Poe2Offsets.Entity.COMPONENT_LIST)
+        if not comp_list:
+            return False
+        comp_count = comp_list[1] // 8
+        return 0 < comp_count <= 256
+
+    def _real_entity(self, entity_ptr: int) -> Optional[int]:
+        """Return the pointer whose components resolve, tolerating indirection.
+
+        Pre-0.5.4 the entity pointer is used directly. Patch 0.5.4 wraps it, so
+        the real entity is read_ptr(entity_ptr). This tries the pointer directly
+        first and falls back to one dereference, caching the decision per raw
+        pointer (mirrors the flask bot's Life-component fix).
+        """
+        if not entity_ptr or entity_ptr < 0x10000:
+            return None
+        cached = self._real_entity_cache.get(entity_ptr)
+        if cached is not None:
+            return cached
+        real = entity_ptr
+        if not self._entity_resolves(entity_ptr):
+            deref = self._read_ptr(entity_ptr)
+            if deref and deref > 0x10000 and self._entity_resolves(deref):
+                real = deref
+        self._real_entity_cache[entity_ptr] = real
+        return real
 
     def _resolve_component(self, entity_ptr: int, component_name: str) -> Optional[int]:
         """Resolve a component address by name via EntityDetails -> ComponentLookUp."""
