@@ -16,6 +16,7 @@ import struct
 import pymem
 import pymem.process
 import ctypes
+from collections import deque
 from ctypes import wintypes
 from typing import Optional, Callable, Dict, Any, List, Tuple
 
@@ -273,7 +274,7 @@ class StructureReader:
     GAME_STATES_INSTR_LEN = 16
 
     # Structure offsets - these are the only things that may change per patch
-    # Last validated: 2026-06-04
+    # Last validated: 2026-09-03
     class Offsets:
         # GameState
         CURRENT_STATE_PTR = 0x08
@@ -299,11 +300,12 @@ class StructureReader:
         ENTRY_STRIDE = 0x10
 
         # Life component - VitalStruct locations
-        HEALTH = 0x1B0
-        MANA = 0x208
-        ENERGY_SHIELD = 0x248
+        # 2026-09-03 patch shifted the whole Life struct by -0x50 (header shrank).
+        HEALTH = 0x160          # was 0x1B0
+        MANA = 0x1B8            # was 0x208
+        ENERGY_SHIELD = 0x1F8   # was 0x248
 
-        # VitalStruct layout
+        # VitalStruct layout (unchanged this patch)
         VITAL_MAX = 0x2C
         VITAL_CURRENT = 0x30
 
@@ -575,14 +577,22 @@ class StructureReader:
         and then one dereference deeper, returning whichever yields a valid
         Life component. This keeps the bot working across both layouts without
         hardcoding a patch-specific offset.
+
+        If the name-bucket chain itself shifts (as in the 2026-09-03 patch,
+        which also reorganised EntityDetails/ComponentLookup and added another
+        player->entity indirection), we fall back to a signature-based search
+        that locates the Life component by its VitalStruct layout.
         """
+        mod = self._module_bounds()
         for entity_ptr in (player_ptr, self._read_ptr(player_ptr)):
             if not entity_ptr or entity_ptr < 0x10000:
                 continue
             life = self._resolve_life_for_entity(entity_ptr)
-            if life:
+            if life and self._looks_like_life(life, mod):
                 return life
-        return None
+
+        # Fallback: chain offsets shifted this patch; find Life by signature.
+        return self._find_life_by_signature(player_ptr, mod)
 
     def _resolve_life_for_entity(self, entity_ptr: int) -> Optional[int]:
         """Resolve the Life component address for a specific entity pointer."""
@@ -627,6 +637,109 @@ class StructureReader:
                 if index is not None and 0 <= index < comp_count:
                     return self._read_ptr(comp_list_begin + index * 8)
 
+        return None
+
+    def _module_bounds(self) -> Optional[Tuple[int, int]]:
+        """Return (base, base+size) of the game module, or None."""
+        if not self.pm:
+            return None
+        try:
+            name = self.PROCESS_NAMES.get(self.game_version, "PathOfExileSteam.exe")
+            module = pymem.process.module_from_name(self.pm.process_handle, name)
+            if not module:
+                return None
+            return (module.lpBaseOfDll, module.lpBaseOfDll + module.SizeOfImage)
+        except Exception:
+            return None
+
+    def _looks_like_life(self, comp_ptr: Optional[int],
+                         mod: Optional[Tuple[int, int]]) -> bool:
+        """Validate a Life component by its VitalStruct signature.
+
+        A real Life component has a module vtable at offset 0 and three
+        internally-consistent VitalStructs (HP/Mana/ES) where the max is sane
+        and 0 <= current <= max. This lets us verify a resolved pointer without
+        trusting the (patch-fragile) name-bucket index mapping.
+        """
+        if not comp_ptr or comp_ptr < 0x10000:
+            return False
+        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
+        data = self._read_bytes(comp_ptr, max(need, 0x18))
+        return self._block_is_life(data, mod)
+
+    def _block_is_life(self, data: Optional[bytes],
+                       mod: Optional[Tuple[int, int]]) -> bool:
+        """Byte-level Life-component check (see _looks_like_life)."""
+        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
+        if not data or len(data) < need:
+            return False
+        if mod:
+            vtable = struct.unpack_from('<Q', data, 0)[0]
+            if not (mod[0] <= vtable < mod[1]):
+                return False
+
+        def vital(base: int) -> Tuple[int, int]:
+            mx = struct.unpack_from('<i', data, base + self.Offsets.VITAL_MAX)[0]
+            cur = struct.unpack_from('<i', data, base + self.Offsets.VITAL_CURRENT)[0]
+            return cur, mx
+
+        hp_cur, hp_max = vital(self.Offsets.HEALTH)
+        mp_cur, mp_max = vital(self.Offsets.MANA)
+        es_cur, es_max = vital(self.Offsets.ENERGY_SHIELD)
+
+        # A living player: HP present with current >= 1, Mana/ES consistent,
+        # and at least one secondary resource (mana or ES) present. The last
+        # check rejects mostly-zero structs that only coincidentally carry a
+        # pointer high-dword (e.g. 0x559 == 1369) in the HP-max slot.
+        if not (1 <= hp_max <= 50000 and 1 <= hp_cur <= hp_max):
+            return False
+        if not (0 <= mp_max <= 50000 and 0 <= mp_cur <= mp_max):
+            return False
+        if not (0 <= es_max <= 200000 and 0 <= es_cur <= es_max):
+            return False
+        if mp_max <= 0 and es_max <= 0:
+            return False
+        return True
+
+    def _find_life_by_signature(self, player_ptr: int,
+                                mod: Optional[Tuple[int, int]]) -> Optional[int]:
+        """Find the Life component via a bounded, breadth-first pointer walk.
+
+        Patch-resilient fallback: from the player entity we walk the pointer
+        graph and return the shallowest reachable component that passes
+        _looks_like_life. Because the local-player pointer only reaches the
+        player's own object graph, the shallowest valid Life is the player's.
+        Reads one block per node (children + vitals) to keep it fast; the
+        result is cached by the caller.
+        """
+        if not self.pm or not player_ptr or player_ptr < 0x10000:
+            return None
+
+        WINDOW = 0x400          # bytes scanned per node for child pointers
+        MAX_DEPTH = 7
+        MAX_VISITED = 60000
+        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
+        block_size = max(WINDOW, need)
+
+        seen = {player_ptr}
+        queue = deque([(player_ptr, 0)])
+        while queue and len(seen) < MAX_VISITED:
+            node, depth = queue.popleft()
+            block = self._read_bytes(node, block_size)
+            if not block:
+                continue
+            # Is this node itself a Life component?
+            if self._block_is_life(block, mod):
+                return node
+            if depth >= MAX_DEPTH:
+                continue
+            limit = min(len(block), WINDOW) - 8
+            for off in range(0, limit + 1, 8):
+                child = struct.unpack_from('<Q', block, off)[0]
+                if child in seen or not (0x10000 < child < 0x7FFFFFFFFFFF):
+                    continue
+                seen.add(child)
+                queue.append((child, depth + 1))
         return None
 
     def _read_vital_struct(self, life_component: int, vital_offset: int) -> Tuple[int, int]:
