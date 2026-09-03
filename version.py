@@ -5,7 +5,7 @@ Single source of truth for application version.
 Updated automatically by build_exe.py --bump [patch|minor|major]
 """
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 
 def parse_version(version_str: str) -> tuple:
