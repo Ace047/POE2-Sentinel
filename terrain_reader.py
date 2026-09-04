@@ -214,12 +214,13 @@ class Poe2Offsets:
         STD_MAP_SIZE = 0x10             # Each StdMap is {Head ptr, int Size, pad}
         VISUAL_ID_THRESHOLD = 0x40000000  # Entities below are real, above are visuals
 
-    # Life component offsets - ✓ validated live 2026-09-03
+    # Life component offsets - ✓ validated live 2026-09-04 (hotfix reverted the
+    # 2026-09-03 -0x50 shift; Life vital block is back to the 0x1B0 family).
     class Life:
         OWNER = 0x008                   # ComponentHeader.EntityPtr
-        HEALTH = 0x160                  # ✓ VitalStruct (was 0x1B0 pre-patch)
-        MANA = 0x1B8                    # ✓ VitalStruct (was 0x208 pre-patch)
-        ENERGY_SHIELD = 0x1F8           # ✓ VitalStruct (was 0x248 pre-patch)
+        HEALTH = 0x1B0                  # ✓ VitalStruct (2026-09-04: 0x160 -> 0x1B0)
+        MANA = 0x208                    # ✓ VitalStruct (2026-09-04: 0x1B8 -> 0x208)
+        ENERGY_SHIELD = 0x248           # ✓ VitalStruct (2026-09-04: 0x1F8 -> 0x248)
 
     # VitalStruct offsets
     class VitalStruct:

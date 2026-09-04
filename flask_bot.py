@@ -300,14 +300,26 @@ class StructureReader:
         ENTRY_STRIDE = 0x10
 
         # Life component - VitalStruct locations
-        # 2026-09-03 patch shifted the whole Life struct by -0x50 (header shrank).
-        HEALTH = 0x160          # was 0x1B0
-        MANA = 0x1B8            # was 0x208
-        ENERGY_SHIELD = 0x1F8   # was 0x248
+        # The whole Life vital block shifts as a unit between two known layouts
+        # (the relative spacing MANA=HEALTH+0x58, ES=HEALTH+0x98 is constant):
+        #   0x1B0 family (pre-2026-09-03 and again 2026-09-04 hotfix)
+        #   0x160 family (2026-09-03 patch, -0x50 header shrink) - later reverted.
+        HEALTH = 0x1B0          # 2026-09-04 hotfix reverted 0x160 -> 0x1B0
+        MANA = 0x208            # 2026-09-04 hotfix reverted 0x1B8 -> 0x208
+        ENERGY_SHIELD = 0x248   # 2026-09-04 hotfix reverted 0x1F8 -> 0x248
 
         # VitalStruct layout (unchanged this patch)
         VITAL_MAX = 0x2C
         VITAL_CURRENT = 0x30
+
+    # The Life vital block shifts as a unit between game builds, but the spacing
+    # between the three vitals is invariant (MANA=HEALTH+0x58, ES=HEALTH+0x98).
+    # We auto-detect the HEALTH base among known layouts inside the confirmed
+    # Life component, so a base flip-flop (0x160 <-> 0x1B0) self-heals without a
+    # code change. Add any brand-new base observed after a patch to the list.
+    VITAL_MANA_FROM_HEALTH = 0x58   # 0x208-0x1B0 == 0x1B8-0x160
+    VITAL_ES_FROM_HEALTH = 0x98     # 0x248-0x1B0 == 0x1F8-0x160
+    KNOWN_HEALTH_BASES = (0x1B0, 0x160)  # most-likely first
 
     def __init__(self, game_version: str = "steam", config: Optional[dict] = None):
         self.game_version = game_version
@@ -319,6 +331,7 @@ class StructureReader:
         self._game_state_slot: Optional[int] = None
         self._life_component_cache: Optional[int] = None
         self._cached_player_ptr: Optional[int] = None  # Track player ptr for zone change detection
+        self._vital_health_base: Optional[int] = None  # Auto-detected Life vital layout base
 
         # Load custom offsets from config if provided
         self._load_offsets(config)
@@ -365,6 +378,7 @@ class StructureReader:
             self._game_state_slot = None  # Reset AOB cache on reconnect
             self._life_component_cache = None
             self._cached_player_ptr = None  # Reset player cache
+            self._vital_health_base = None  # Reset detected vital layout
             logger.info(f"StructureReader connected to {process_name} at 0x{self.base_address:X}")
             return True
         except Exception as e:
@@ -383,6 +397,7 @@ class StructureReader:
         self.connected = False
         self._game_state_slot = None
         self._life_component_cache = None
+        self._vital_health_base = None
 
     def _is_process_alive(self) -> bool:
         """Return True if the attached game process is still running.
@@ -674,45 +689,51 @@ class StructureReader:
         except Exception:
             return None
 
-    def _looks_like_life(self, comp_ptr: Optional[int],
-                         mod: Optional[Tuple[int, int]]) -> bool:
-        """Validate a Life component by its VitalStruct signature.
+    def _health_base_candidates(self) -> List[int]:
+        """HEALTH-base offsets to try, most-likely first (config override wins)."""
+        bases: List[int] = []
+        for b in (self.Offsets.HEALTH, *self.KNOWN_HEALTH_BASES):
+            if b not in bases:
+                bases.append(b)
+        return bases
 
-        A real Life component has a module vtable at offset 0 and three
-        internally-consistent VitalStructs (HP/Mana/ES) where the max is sane
-        and 0 <= current <= max. This lets us verify a resolved pointer without
-        trusting the (patch-fragile) name-bucket index mapping.
+    def _life_block_size(self) -> int:
+        """Bytes to read to cover every candidate vital layout."""
+        max_base = max(self._health_base_candidates())
+        return max_base + self.VITAL_ES_FROM_HEALTH + self.Offsets.VITAL_CURRENT + 4
+
+    def _vital_triple(self, data: bytes, health_base: int
+                      ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int],
+                                          Tuple[int, int]]]:
+        """Read (HP, Mana, ES) as (current, max) for a given HEALTH base.
+
+        Mana and ES are at the invariant spacing from HEALTH. Returns None if
+        the block is too short for this base.
         """
-        if not comp_ptr or comp_ptr < 0x10000:
-            return False
-        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
-        data = self._read_bytes(comp_ptr, max(need, 0x18))
-        return self._block_is_life(data, mod)
-
-    def _block_is_life(self, data: Optional[bytes],
-                       mod: Optional[Tuple[int, int]]) -> bool:
-        """Byte-level Life-component check (see _looks_like_life)."""
-        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
+        es_base = health_base + self.VITAL_ES_FROM_HEALTH
+        need = es_base + self.Offsets.VITAL_CURRENT + 4
         if not data or len(data) < need:
-            return False
-        if mod:
-            vtable = struct.unpack_from('<Q', data, 0)[0]
-            if not (mod[0] <= vtable < mod[1]):
-                return False
+            return None
 
         def vital(base: int) -> Tuple[int, int]:
             mx = struct.unpack_from('<i', data, base + self.Offsets.VITAL_MAX)[0]
             cur = struct.unpack_from('<i', data, base + self.Offsets.VITAL_CURRENT)[0]
             return cur, mx
 
-        hp_cur, hp_max = vital(self.Offsets.HEALTH)
-        mp_cur, mp_max = vital(self.Offsets.MANA)
-        es_cur, es_max = vital(self.Offsets.ENERGY_SHIELD)
+        return (vital(health_base),
+                vital(health_base + self.VITAL_MANA_FROM_HEALTH),
+                vital(es_base))
 
-        # A living player: HP present with current >= 1, Mana/ES consistent,
-        # and at least one secondary resource (mana or ES) present. The last
-        # check rejects mostly-zero structs that only coincidentally carry a
-        # pointer high-dword (e.g. 0x559 == 1369) in the HP-max slot.
+    @staticmethod
+    def _triple_is_valid(triple: Tuple[Tuple[int, int], Tuple[int, int],
+                                       Tuple[int, int]]) -> bool:
+        """A living player's vital triple: HP present, Mana/ES consistent.
+
+        Requires at least one secondary resource (Mana or ES) present so a
+        mostly-zero struct that only coincidentally carries a pointer high-dword
+        (e.g. 0x559 == 1369) in the HP-max slot is rejected.
+        """
+        (hp_cur, hp_max), (mp_cur, mp_max), (es_cur, es_max) = triple
         if not (1 <= hp_max <= 50000 and 1 <= hp_cur <= hp_max):
             return False
         if not (0 <= mp_max <= 50000 and 0 <= mp_cur <= mp_max):
@@ -722,6 +743,64 @@ class StructureReader:
         if mp_max <= 0 and es_max <= 0:
             return False
         return True
+
+    def _detect_health_base(self, data: Optional[bytes],
+                            mod: Optional[Tuple[int, int]]) -> Optional[int]:
+        """Return the HEALTH base whose vital triple validates, or None.
+
+        The block must start with a module vtable (real component), then the
+        first candidate layout that yields a valid triple wins. This is what
+        makes a base flip-flop (0x160 <-> 0x1B0) self-heal.
+        """
+        if not data:
+            return None
+        if mod and len(data) >= 8:
+            vtable = struct.unpack_from('<Q', data, 0)[0]
+            if not (mod[0] <= vtable < mod[1]):
+                return None
+        for base in self._health_base_candidates():
+            triple = self._vital_triple(data, base)
+            if triple and self._triple_is_valid(triple):
+                return base
+        return None
+
+    def _looks_like_life(self, comp_ptr: Optional[int],
+                         mod: Optional[Tuple[int, int]]) -> bool:
+        """Validate a Life component by its VitalStruct signature.
+
+        A real Life component has a module vtable at offset 0 and three
+        internally-consistent VitalStructs (HP/Mana/ES) at one of the known
+        layouts. This lets us verify a resolved pointer without trusting the
+        (patch-fragile) name-bucket index mapping, and tolerates the vital block
+        shifting between layouts.
+        """
+        if not comp_ptr or comp_ptr < 0x10000:
+            return False
+        data = self._read_bytes(comp_ptr, max(self._life_block_size(), 0x18))
+        return self._block_is_life(data, mod)
+
+    def _block_is_life(self, data: Optional[bytes],
+                       mod: Optional[Tuple[int, int]]) -> bool:
+        """Byte-level Life-component check (see _looks_like_life)."""
+        return self._detect_health_base(data, mod) is not None
+
+    def _resolve_vital_base(self, life_component: int) -> Optional[int]:
+        """Detect (and cache) the HEALTH base for a confirmed Life component.
+
+        Re-uses the cached base while it still validates, so detection runs at
+        most once per layout. Returns None if no known layout fits (a brand-new
+        vital layout - add its base to KNOWN_HEALTH_BASES).
+        """
+        data = self._read_bytes(life_component, self._life_block_size())
+        if not data:
+            return None
+        if self._vital_health_base is not None:
+            triple = self._vital_triple(data, self._vital_health_base)
+            if triple and self._triple_is_valid(triple):
+                return self._vital_health_base
+        base = self._detect_health_base(data, self._module_bounds())
+        self._vital_health_base = base
+        return base
 
     def _find_life_by_signature(self, player_ptr: int,
                                 mod: Optional[Tuple[int, int]]) -> Optional[int]:
@@ -740,8 +819,7 @@ class StructureReader:
         WINDOW = 0x400          # bytes scanned per node for child pointers
         MAX_DEPTH = 7
         MAX_VISITED = 60000
-        need = self.Offsets.ENERGY_SHIELD + self.Offsets.VITAL_CURRENT + 4
-        block_size = max(WINDOW, need)
+        block_size = max(WINDOW, self._life_block_size())
 
         seen = {player_ptr}
         queue = deque([(player_ptr, 0)])
@@ -817,15 +895,27 @@ class StructureReader:
                 logger.debug("Could not resolve Life component")
                 return None
 
-            # Read HP, ES, and Mana
-            hp_cur, hp_max = self._read_vital_struct(life, self.Offsets.HEALTH)
-            es_cur, es_max = self._read_vital_struct(life, self.Offsets.ENERGY_SHIELD)
-            mp_cur, mp_max = self._read_vital_struct(life, self.Offsets.MANA)
+            # Auto-detect the vital layout inside the confirmed Life component
+            # so a base flip-flop (0x160 <-> 0x1B0) self-heals across patches.
+            base = self._resolve_vital_base(life)
+            if base is None:
+                logger.debug("Could not detect Life vital layout")
+                self._life_component_cache = None  # Force re-resolve next call
+                self._vital_health_base = None
+                return None
+
+            # Read HP, ES, and Mana at the detected layout.
+            hp_cur, hp_max = self._read_vital_struct(life, base)
+            es_cur, es_max = self._read_vital_struct(
+                life, base + self.VITAL_ES_FROM_HEALTH)
+            mp_cur, mp_max = self._read_vital_struct(
+                life, base + self.VITAL_MANA_FROM_HEALTH)
 
             # Sanity check
             if hp_max <= 0 or hp_max > 50000:
                 self._life_component_cache = None  # Invalidate cache
                 self._cached_player_ptr = None  # Also reset player cache
+                self._vital_health_base = None
                 return None
 
             return {
