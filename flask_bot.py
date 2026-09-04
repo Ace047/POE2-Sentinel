@@ -274,7 +274,7 @@ class StructureReader:
     GAME_STATES_INSTR_LEN = 16
 
     # Structure offsets - these are the only things that may change per patch
-    # Last validated: 2026-09-03
+    # Last validated: 2026-09-04
     class Offsets:
         # GameState
         CURRENT_STATE_PTR = 0x08
@@ -283,10 +283,10 @@ class StructureReader:
         STATE_SLOT_COUNT = 12
 
         # InGameState
-        AREA_INSTANCE_DATA = 0x290
+        AREA_INSTANCE_DATA = 0x2A0   # 2026-09-04 patch: was 0x290
 
         # AreaInstance
-        LOCAL_PLAYER = 0x5A0
+        LOCAL_PLAYER = 0x5D0         # 2026-09-04 patch: was 0x5A0
 
         # Entity
         ENTITY_DETAILS_PTR = 0x08
@@ -544,17 +544,39 @@ class StructureReader:
             if igs_ptr and igs_ptr > 0x10000 and igs_ptr not in candidates:
                 candidates.append(igs_ptr)
 
-        # Validate candidates and find LocalPlayer
+        # Validate candidates and find LocalPlayer. Several GameState slots hold
+        # non-InGameState objects, so LOCAL_PLAYER may read a stale/module/garbage
+        # value (the 2026-09-04 patch surfaced this: the first candidate returned a
+        # module pointer). Only accept a slot that reads like a real heap entity.
+        mod = self._module_bounds()
         for igs in candidates:
             area_instance = self._read_ptr(igs + self.Offsets.AREA_INSTANCE_DATA)
             if not area_instance or area_instance < 0x10000:
                 continue
 
             local_player = self._read_ptr(area_instance + self.Offsets.LOCAL_PLAYER)
-            if local_player and local_player > 0x10000:
+            if self._looks_like_entity(local_player, mod):
                 return local_player
 
         return None
+
+    def _looks_like_entity(self, ptr: Optional[int],
+                           mod: Optional[Tuple[int, int]]) -> bool:
+        """Cheap check that `ptr` is a real heap entity object.
+
+        A game entity is heap-allocated (so NOT inside the module image) and its
+        first qword is a vtable pointing INTO the module. This O(1) test rejects
+        the garbage/module/stale pointers that non-InGameState slots produce,
+        without the cost of a full component walk.
+        """
+        if not ptr or ptr < 0x10000:
+            return False
+        if not mod:
+            return True  # can't verify module bounds; fall back to plausibility
+        if mod[0] <= ptr < mod[1]:
+            return False  # entities live on the heap, not in the module image
+        vtable = self._read_ptr(ptr)
+        return bool(vtable) and mod[0] <= vtable < mod[1]
 
     def _read_utf8_string(self, addr: int, max_length: int = 32) -> str:
         """Read a null-terminated UTF-8 string."""

@@ -134,7 +134,7 @@ class Poe2Offsets:
 
     # InGameState offsets (from InGameState base)
     class InGameState:
-        AREA_INSTANCE_DATA = 0x290  # ✓ -> AreaInstance (validated in POE2Radar)
+        AREA_INSTANCE_DATA = 0x2A0  # 2026-09-04 patch: was 0x290 -> AreaInstance
         UI_ROOT = 0x2F0             # ✓ -> root UiElement
         CAMERA = 0x368              # ✓ -> Camera object
         WORLD_DATA = 0x310          # (GH2-drift) -> WorldData
@@ -142,10 +142,14 @@ class Poe2Offsets:
     # AreaInstance offsets (from AreaInstance base)
     class AreaInstance:
         AREA_INFO_PTR = 0x0A0       # ✓ -> AreaInfo
-        LOCAL_PLAYER = 0x5A0        # ✓ -> player Entity (unchanged in 0.5.4)
+        LOCAL_PLAYER = 0x5D0        # 2026-09-04 patch: was 0x5A0 -> player Entity
         # Patch 0.5.4 inserted 0x18 bytes after LocalPlayer, shifting every
         # AreaInstance field above 0x5A0 by +0x18 (verified live via
         # tools/diagnose_overlay.py).
+        # NOTE: the 2026-09-04 patch moved LOCAL_PLAYER 0x5A0->0x5D0. The
+        # entity/terrain map offsets below are NOT yet re-verified for that patch
+        # (flask HP/Mana was the reported break); run tools/diagnose_overlay.py
+        # if the overlay's entity dots / terrain are off.
         AWAKE_ENTITIES = 0x6D8      # ✓ StdMap of live entities (was 0x6C0)
         SLEEPING_ENTITIES = 0x6E8   # ✓ StdMap of inactive entities (was 0x6D0)
         TERRAIN_METADATA = 0x8B8    # ✓ -> TerrainStruct base (was 0x8A0)

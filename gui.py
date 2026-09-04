@@ -99,9 +99,10 @@ class SentinelGUI:
         self.terrain_overlay = None
         if OVERLAY_AVAILABLE:
             self.terrain_overlay = MapOverlayManager(self.terrain_reader)
-            # Pre-spawn overlay process at startup so it's ready when user toggles
-            # This eliminates the ~3 second startup delay
-            self._prespawn_overlay()
+            # Overlay process is spawned lazily on first toggle (F11), not at
+            # startup: spawning a multiprocessing child on the UI thread froze
+            # the window (and crashed under the one-file build) whenever the
+            # game wasn't running.
 
         # Navigation/panel registries (populated by _build_ui)
         self.panels = {}
@@ -531,53 +532,6 @@ class SentinelGUI:
         if btn:
             btn.configure(text=self._hotkey_label(key), text_color=self.colors["primary"])
         self.show_toast(f"Hotkey set: {self._hotkey_label(key)}", "success")
-
-    def _prespawn_overlay(self):
-        """Pre-spawn overlay process in background so it's ready when user toggles.
-
-        This eliminates the ~3 second startup delay by having the process
-        already running (hidden) when the user presses F11.
-        """
-        if not self.terrain_overlay:
-            print("[PRE-SPAWN] No terrain overlay manager")
-            return
-
-        def spawn_in_background():
-            import time
-            from map_overlay import OverlayConfig, hex_to_rgba
-            print("[PRE-SPAWN] Starting overlay process...")
-            t0 = time.time()
-            try:
-                # Get current overlay config (simplified - just use defaults for pre-spawn)
-                overlay_cfg = self.config.get("overlay", {})
-
-                interior_hex = overlay_cfg.get("interior_color", "#506482")
-                edge_hex = overlay_cfg.get("edge_color", "#3CDCFF")
-                interior_opacity = int(overlay_cfg.get("interior_opacity", 12) * 255 / 100)
-                edge_opacity = int(overlay_cfg.get("edge_opacity", 70) * 255 / 100)
-
-                config = OverlayConfig(
-                    interior_color=hex_to_rgba(interior_hex, alpha=interior_opacity),
-                    edge_color=hex_to_rgba(edge_hex, alpha=edge_opacity),
-                    show_entities=overlay_cfg.get("show_entities", True),
-                    show_terrain=False,  # Entity-icons-only mode (shader reveal handles the map)
-                )
-                self.terrain_overlay.update_config(config)
-
-                # Start the process (it will be hidden initially since we don't call show)
-                # The process will start and connect to the game in background
-                result = self.terrain_overlay._ensure_process_running()
-                t1 = time.time()
-                print(f"[PRE-SPAWN] Process started in {(t1-t0)*1000:.0f}ms, result={result}")
-                print("[PRE-SPAWN] Overlay process pre-spawned and ready - F11 should be instant now!")
-            except Exception as e:
-                import traceback
-                print(f"[PRE-SPAWN] Failed to pre-spawn overlay: {e}")
-                traceback.print_exc()
-
-        # Spawn after a short delay so it doesn't slow down GUI startup
-        print("[PRE-SPAWN] Scheduling pre-spawn in 500ms...")
-        self.root.after(500, spawn_in_background)
 
     def show_help(self):
         """Show help dialog."""
