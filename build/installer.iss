@@ -6,7 +6,7 @@
 ; on the target PC; without it that one feature degrades gracefully.
 
 #define MyAppName "POE2 Sentinel"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.1.4"
 #define MyAppPublisher "Ace047"
 #define MyAppExeName "POE2Sentinel.exe"
 
