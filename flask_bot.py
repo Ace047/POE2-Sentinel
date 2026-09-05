@@ -332,6 +332,7 @@ class StructureReader:
         self._life_component_cache: Optional[int] = None
         self._cached_player_ptr: Optional[int] = None  # Track player ptr for zone change detection
         self._vital_health_base: Optional[int] = None  # Auto-detected Life vital layout base
+        self._cached_igs: Optional[int] = None  # InGameState slot that yielded the real player
 
         # Load custom offsets from config if provided
         self._load_offsets(config)
@@ -379,6 +380,7 @@ class StructureReader:
             self._life_component_cache = None
             self._cached_player_ptr = None  # Reset player cache
             self._vital_health_base = None  # Reset detected vital layout
+            self._cached_igs = None  # Reset InGameState cache
             logger.info(f"StructureReader connected to {process_name} at 0x{self.base_address:X}")
             return True
         except Exception as e:
@@ -398,6 +400,8 @@ class StructureReader:
         self._game_state_slot = None
         self._life_component_cache = None
         self._vital_health_base = None
+        self._cached_player_ptr = None
+        self._cached_igs = None
 
     def _is_process_alive(self) -> bool:
         """Return True if the attached game process is still running.
@@ -532,6 +536,15 @@ class StructureReader:
         """Find the local player entity address.
 
         Chain: GameStateSlot -> GameState -> InGameState -> AreaInstance -> LocalPlayer
+
+        Several GameState slots hold non-player InGameState objects whose
+        AreaInstance+LOCAL_PLAYER reads a heap pointer that passes the cheap
+        entity check but is NOT the character - e.g. an empty/transient entity
+        with zero components (common right after a zone change, which is what
+        broke HP/Mana when we just took the first entity-looking pointer). We
+        therefore positively identify the player by requiring a resolvable
+        "Player" component, and cache the winning InGameState so steady-state
+        reads stay cheap.
         """
         slot = self._find_game_state_slot()
         if not slot:
@@ -542,8 +555,19 @@ class StructureReader:
         if not game_state or game_state < 0x10000:
             return None
 
-        # Try to find valid InGameState
-        candidates = []
+        mod = self._module_bounds()
+
+        # Fast path: reuse the InGameState that last produced the real player.
+        # It self-invalidates once that slot stops yielding a Player-component
+        # entity (i.e. after a zone change), forcing a full rescan below.
+        if self._cached_igs:
+            local_player = self._player_from_igs(self._cached_igs, mod)
+            if local_player:
+                return local_player
+            self._cached_igs = None
+
+        # Collect InGameState candidates.
+        candidates: List[int] = []
 
         # Method 1: CurrentStatePtr StdVector
         vec_first = self._read_ptr(game_state + self.Offsets.CURRENT_STATE_PTR)
@@ -559,21 +583,94 @@ class StructureReader:
             if igs_ptr and igs_ptr > 0x10000 and igs_ptr not in candidates:
                 candidates.append(igs_ptr)
 
-        # Validate candidates and find LocalPlayer. Several GameState slots hold
-        # non-InGameState objects, so LOCAL_PLAYER may read a stale/module/garbage
-        # value (the 2026-09-04 patch surfaced this: the first candidate returned a
-        # module pointer). Only accept a slot that reads like a real heap entity.
-        mod = self._module_bounds()
+        # Pass 1: the true character is the entity exposing a Player component.
         for igs in candidates:
-            area_instance = self._read_ptr(igs + self.Offsets.AREA_INSTANCE_DATA)
-            if not area_instance or area_instance < 0x10000:
-                continue
+            local_player = self._player_from_igs(igs, mod, require_player=True)
+            if local_player:
+                self._cached_igs = igs
+                return local_player
 
-            local_player = self._read_ptr(area_instance + self.Offsets.LOCAL_PLAYER)
-            if self._looks_like_entity(local_player, mod):
+        # Pass 2 (defensive): if the name bucket shifted this patch and no
+        # candidate exposes a Player component, fall back to the first entity
+        # that at least resolves a valid Life component (better than a decoy
+        # whose only qualification is a heap vtable).
+        for igs in candidates:
+            local_player = self._player_from_igs(igs, mod, require_life=True)
+            if local_player:
+                self._cached_igs = igs
                 return local_player
 
         return None
+
+    def _player_from_igs(self, igs: int, mod: Optional[Tuple[int, int]],
+                         require_player: bool = False,
+                         require_life: bool = False) -> Optional[int]:
+        """Read+validate AreaInstance -> LocalPlayer for one InGameState.
+
+        With no flags (fast-path / cache revalidation) and with require_player,
+        the entity must expose a "Player" component. require_life instead accepts
+        any heap entity that resolves a valid Life component (defensive
+        fallback). Returns the player pointer or None.
+        """
+        area_instance = self._read_ptr(igs + self.Offsets.AREA_INSTANCE_DATA)
+        if not area_instance or area_instance < 0x10000:
+            return None
+        local_player = self._read_ptr(area_instance + self.Offsets.LOCAL_PLAYER)
+        if not self._looks_like_entity(local_player, mod):
+            return None
+        if require_life and not require_player:
+            life = self._resolve_life_component(local_player)
+            if life and self._looks_like_life(life, mod):
+                return local_player
+            return None
+        # Default + require_player: demand a real Player component.
+        return local_player if self._looks_like_player(local_player) else None
+
+    def _entity_component_names(self, entity_ptr: int,
+                               limit: int = 64) -> List[str]:
+        """Return the component names an entity exposes (name-bucket walk).
+
+        Mirrors the lookup in _resolve_life_for_entity; returns [] if the chain
+        doesn't resolve (non-player / transient entities have an empty bucket).
+        """
+        if not entity_ptr or entity_ptr < 0x10000:
+            return []
+        details = self._read_ptr(entity_ptr + self.Offsets.ENTITY_DETAILS_PTR)
+        if not details:
+            return []
+        lookup = self._read_ptr(details + self.Offsets.COMPONENT_LOOKUP_PTR)
+        if not lookup:
+            return []
+        bucket_begin = self._read_ptr(lookup + self.Offsets.NAME_AND_INDEX_BUCKET)
+        bucket_end = self._read_ptr(lookup + self.Offsets.NAME_AND_INDEX_BUCKET + 8)
+        if not bucket_begin or not bucket_end or bucket_end <= bucket_begin:
+            return []
+        num_entries = (bucket_end - bucket_begin) // self.Offsets.ENTRY_STRIDE
+        if num_entries <= 0 or num_entries > 256:
+            return []
+        names: List[str] = []
+        for i in range(min(num_entries, limit)):
+            entry_addr = bucket_begin + i * self.Offsets.ENTRY_STRIDE
+            name_ptr = self._read_ptr(entry_addr)
+            if not name_ptr:
+                continue
+            name = self._read_utf8_string(name_ptr)
+            if name:
+                names.append(name)
+        return names
+
+    def _looks_like_player(self, entity_ptr: Optional[int]) -> bool:
+        """True only if the entity exposes a 'Player'/'PlayerClass' component.
+
+        This positively distinguishes the local character from decoy entities
+        (empty/transient objects that pass the cheap _looks_like_entity check
+        but carry no components) - the failure that corrupts HP/Mana on zone
+        changes when we just take the first entity-looking pointer.
+        """
+        if not entity_ptr or entity_ptr < 0x10000:
+            return False
+        names = self._entity_component_names(entity_ptr)
+        return "Player" in names or "PlayerClass" in names
 
     def _looks_like_entity(self, ptr: Optional[int],
                            mod: Optional[Tuple[int, int]]) -> bool:
@@ -916,6 +1013,7 @@ class StructureReader:
                 self._life_component_cache = None  # Invalidate cache
                 self._cached_player_ptr = None  # Also reset player cache
                 self._vital_health_base = None
+                self._cached_igs = None  # Force InGameState rescan
                 return None
 
             return {
@@ -930,6 +1028,7 @@ class StructureReader:
             logger.debug(f"StructureReader read failed: {e}")
             self._life_component_cache = None
             self._cached_player_ptr = None
+            self._cached_igs = None
             return None
 
 

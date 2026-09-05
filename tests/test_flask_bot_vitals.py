@@ -120,3 +120,100 @@ class TestResolveVitalBaseSelfHeal:
         r._read_bytes = lambda addr, size: data           # type: ignore
         r._module_bounds = lambda: None                    # type: ignore
         assert r._resolve_vital_base(0xDEAD) is None
+
+
+# Fake pointers must clear the real 0x10000 heap-plausibility guards.
+_MOD = (0x7FF600000000, 0x7FF700000000)
+_SLOT, _GS = 0x101000, 0x102000
+_DECOY_IGS, _DECOY_AREA, _DECOY_PLAYER = 0x103000, 0x103100, 0x103200
+_REAL_IGS, _REAL_AREA, _REAL_PLAYER = 0x104000, 0x104100, 0x104200
+_NEW_IGS, _NEW_AREA, _NEW_PLAYER = 0x105000, 0x105100, 0x105200
+
+
+class TestLooksLikePlayer:
+    def test_true_when_player_component_present(self):
+        r = _reader()
+        r._entity_component_names = lambda ptr, limit=64: ["Life", "Player", "Stats"]  # type: ignore
+        assert r._looks_like_player(0x10BEEF) is True
+
+    def test_false_for_empty_component_bucket(self):
+        # A decoy/transient entity resolves an empty bucket -> not the player.
+        r = _reader()
+        r._entity_component_names = lambda ptr, limit=64: []  # type: ignore
+        assert r._looks_like_player(0x10BEEF) is False
+
+    def test_false_for_null_pointer(self):
+        assert _reader()._looks_like_player(0) is False
+
+
+# Fake address space so _find_local_player / _player_from_igs run against a
+# deterministic in-memory world (no live game). Mirrors the real chain:
+# slot -> GameState -> STATES[i] (InGameState) -> AreaInstance -> LocalPlayer.
+def _wire(r: StructureReader, mem: dict, entities: set, comps: dict) -> None:
+    o = r.Offsets
+    mem[_SLOT] = _GS
+    mem.setdefault(_GS + o.CURRENT_STATE_PTR, 0)  # skip StdVector method
+    r._find_game_state_slot = lambda: _SLOT                       # type: ignore
+    r._read_ptr = lambda a: mem.get(a, 0)                          # type: ignore
+    r._module_bounds = lambda: _MOD                                # type: ignore
+    r._looks_like_entity = lambda ptr, mod: ptr in entities        # type: ignore
+    r._entity_component_names = lambda ptr, limit=64: comps.get(ptr, [])  # type: ignore
+
+
+def _add_igs(r: StructureReader, mem: dict, state_index: int,
+             igs: int, area: int, player: int) -> None:
+    o = r.Offsets
+    mem[_GS + o.STATES + state_index * o.STATE_SLOT_STRIDE] = igs
+    mem[igs + o.AREA_INSTANCE_DATA] = area
+    mem[area + o.LOCAL_PLAYER] = player
+
+
+class TestFindLocalPlayerSelection:
+    def test_skips_decoy_and_picks_player_component_entity(self):
+        r = _reader()
+        mem, entities = {}, {_DECOY_PLAYER, _REAL_PLAYER}
+        comps = {_DECOY_PLAYER: [], _REAL_PLAYER: ["Life", "Player", "Stats"]}
+        _wire(r, mem, entities, comps)
+        _add_igs(r, mem, 0, _DECOY_IGS, _DECOY_AREA, _DECOY_PLAYER)  # no comps
+        _add_igs(r, mem, 1, _REAL_IGS, _REAL_AREA, _REAL_PLAYER)     # character
+        assert r._find_local_player() == _REAL_PLAYER
+        assert r._cached_igs == _REAL_IGS
+
+    def test_fast_path_reuses_cached_igs_without_rescan(self):
+        r = _reader()
+        mem, entities = {}, {_REAL_PLAYER}
+        comps = {_REAL_PLAYER: ["Player"]}
+        _wire(r, mem, entities, comps)
+        _add_igs(r, mem, 1, _REAL_IGS, _REAL_AREA, _REAL_PLAYER)
+        r._cached_igs = _REAL_IGS
+        # No STATES entries wired for a rescan; only the cached igs resolves.
+        assert r._find_local_player() == _REAL_PLAYER
+        assert r._cached_igs == _REAL_IGS
+
+    def test_zone_change_invalidates_cache_and_reresolves(self):
+        r = _reader()
+        mem, entities = {}, {_DECOY_PLAYER, _NEW_PLAYER}
+        comps = {_DECOY_PLAYER: [], _NEW_PLAYER: ["Player"]}
+        _wire(r, mem, entities, comps)
+        # Cached igs now yields a decoy (post zone change)...
+        _add_igs(r, mem, 0, _REAL_IGS, _REAL_AREA, _DECOY_PLAYER)
+        # ...and the real character has moved to a different state slot.
+        _add_igs(r, mem, 1, _NEW_IGS, _NEW_AREA, _NEW_PLAYER)
+        r._cached_igs = _REAL_IGS
+        assert r._find_local_player() == _NEW_PLAYER
+        assert r._cached_igs == _NEW_IGS
+
+
+class TestPlayerFromIgs:
+    def test_require_life_fallback_accepts_valid_life_entity(self):
+        r = _reader()
+        mem, entities = {}, {_REAL_PLAYER}
+        comps = {_REAL_PLAYER: []}  # no Player component (name bucket shifted)
+        _wire(r, mem, entities, comps)
+        _add_igs(r, mem, 0, _REAL_IGS, _REAL_AREA, _REAL_PLAYER)
+        r._resolve_life_component = lambda p: 0x1FE00               # type: ignore
+        r._looks_like_life = lambda life, mod: True                 # type: ignore
+        # require_player path rejects (no Player component)...
+        assert r._player_from_igs(_REAL_IGS, _MOD, require_player=True) is None
+        # ...but the defensive require_life path accepts it.
+        assert r._player_from_igs(_REAL_IGS, _MOD, require_life=True) == _REAL_PLAYER
